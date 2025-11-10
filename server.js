@@ -100,6 +100,17 @@ async function passthru(req, res, path) {
 app.post("/v1/responses", async (req, res) => {
   try {
     const { model, stream = true } = req.body || {};
+
+    // Map AFFiNE model names to actual Ollama models
+    const modelMap = {
+      "gpt-4": "gpt-oss:120b",
+      "gpt-4-turbo": "gpt-oss:120b",
+      "gpt-3.5-turbo": "gpt-oss:120b",
+    };
+    const actualModel = modelMap[model] || model || "gpt-oss:120b";
+
+    console.log(`[RESPONSES] AFFiNE requested model: ${model}, using: ${actualModel}`);
+
     // Normalize to OpenAI chat messages (strings only)
     const messages = normalizeMessagesFromBody(req.body);
 
@@ -123,7 +134,7 @@ app.post("/v1/responses", async (req, res) => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model, messages, stream: false,
+          model: actualModel, messages, stream: false,
           temperature, top_p, max_tokens, presence_penalty, frequency_penalty, stop, user, n
         }),
       });
@@ -170,7 +181,7 @@ app.post("/v1/responses", async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model, messages, stream: true,
+        model: actualModel, messages, stream: true,
         temperature, top_p, max_tokens, presence_penalty, frequency_penalty, stop, user, n
       }),
     });
@@ -241,17 +252,76 @@ app.post("/v1/responses", async (req, res) => {
     }
     res.end();
   } catch (err) {
+    console.error(`[RESPONSES] Error: ${err.message}`);
     // defensive error reporting to client in Responses shape
-    sseHeaders(res);
-    sendSSE(res, { type: "response.error", error: { message: (err?.message || "adapter error") } });
-    res.write("data: [DONE]\n\n");
-    res.end();
+    if (!res.headersSent) {
+      sseHeaders(res);
+      sendSSE(res, { type: "response.error", error: { message: (err?.message || "adapter error") } });
+      res.write("data: [DONE]\n\n");
+    }
+    if (!res.finished) {
+      res.end();
+    }
+  }
+});
+
+// ---------- models endpoint ----------
+app.get("/v1/models", async (req, res) => {
+  // Return models that AFFiNE expects
+  res.json({
+    object: "list",
+    data: [
+      // Chat models
+      { id: "gpt-4", object: "model", created: Date.now(), owned_by: "ollama" },
+      { id: "gpt-4-turbo", object: "model", created: Date.now(), owned_by: "ollama" },
+      { id: "gpt-3.5-turbo", object: "model", created: Date.now(), owned_by: "ollama" },
+      // Embedding models - AFFiNE only recognizes these specific ones
+      { id: "text-embedding-3-large", object: "model", created: Date.now(), owned_by: "ollama" },
+      { id: "text-embedding-3-small", object: "model", created: Date.now(), owned_by: "ollama" },
+    ]
+  });
+});
+
+// ---------- embeddings endpoint ----------
+app.post("/v1/embeddings", async (req, res) => {
+  try {
+    const { input, model } = req.body || {};
+
+    // Always use nomic-embed-text regardless of what AFFiNE requests
+    const actualModel = "nomic-embed-text";
+
+    console.log(`[EMBEDDINGS] AFFiNE requested model: ${model}, using: ${actualModel}`);
+
+    const r = await fetch(`${process.env.LITELLM_URL}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.LITELLM_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: actualModel,
+        input: input
+      }),
+    });
+
+    if (!r.ok) {
+      const text = await r.text();
+      console.error(`[EMBEDDINGS] Upstream error: ${r.status} - ${text}`);
+      return res.status(r.status).json({ error: text });
+    }
+
+    const result = await r.json();
+    // Ensure the response has the model name AFFiNE expects
+    result.model = model || "text-embedding-3-large";
+
+    res.json(result);
+  } catch (err) {
+    console.error(`[EMBEDDINGS] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ---------- pass-throughs ----------
-app.get("/v1/models", (req, res) => passthru(req, res, "/v1/models"));
-app.post("/v1/embeddings", (req, res) => passthru(req, res, "/v1/embeddings"));
 app.all("*", (req, res) => passthru(req, res, req.originalUrl));
 
 // ---------- start ----------
